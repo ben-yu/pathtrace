@@ -1,4 +1,4 @@
-from math import sqrt
+from math import sqrt, pi, sin, cos, fabs
 from random import uniform
 import sys
 
@@ -56,17 +56,17 @@ class Scene:
         self.height = height
         self.fov = fov
 
-        self.img = [0] * (width * height)
+        self.img = [0] * self.width * self.height
 
         self.camera = Ray(Vector(50, 52, 295.6), Vector(0, -0.042612, -1).norm())
         self.c_x = Vector(self.width * self.fov / self.height)  # Horizontal camera direction
-        self.c_y = (self.c_x % self.camera.d).norm() * self.fov    # Vertical camera direction
+        self.c_y = (self.c_x % self.camera.direction).norm() * self.fov    # Vertical camera direction
 
     def intersect(self, ray):
         temp = 1e20
         for i, sphere in enumerate(self.spheres):
             d = sphere.intersect(ray)
-            if d < temp:
+            if d and d < temp:
                 temp = d
                 index = i
 
@@ -79,12 +79,88 @@ class Scene:
             return 1
         return x
 
+    def to_color(self, x):
+        return int(self.clamp(x) ** (1 / 2.2) * 255 + 0.5)
+
+    def radiance(self, ray, depth, e=1.):
+        if depth > 10:
+            return Vector()
+
+        hit = self.intersect(ray)
+        if not hit:
+            return Vector()     # return black
+
+        t, sid = hit
+        obj = self.spheres[sid]
+
+        x = ray.origin + ray.direction * t  # ray-scene intersection point
+        n = (x - obj.position).norm()  # sphere normal
+        nl = n if n.dot(ray.direction) else -n
+        f = obj.color  # sphere BRDF modulator
+        p = f.x if (f.x > f.y and f.x > f.z) else (f.y if f.y > f.z else f.z)
+
+        depth += 1
+        if depth > 5 or not p:
+            if uniform(0., 1.) < p:
+                f = f * (1. / p)
+            else:
+                return obj.emission * e
+
+        # ideal diffuse reflection
+        if obj.reflection_type == 'DIFF':
+            r1 = 2 * pi * uniform(0., 1.)  # sample an angle
+            r2 = uniform(0., 1.)
+            r2s = sqrt(r2)  # sample a distance from center
+            # create a random orthonormal coordinate frame (w, u, v)
+            w = nl
+            u = ((Vector(0, 1., 0) if fabs(w.x) > .1 else Vector(1., 0, 0)) % w).norm()
+            v = w % u
+            d = (u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1 - r2)).norm()  # a random reflection ray
+            return obj.emission + f * self.radiance(Ray(x, d), depth)
+
+        # # ideal specular reflection
+        elif obj.reflection_type == 'SPEC':
+            return obj.emission + f * self.radiance(Ray(x, ray.direction - n * 2 * n.dot(ray.direction)), depth)
+
+        # ideal dielectric refraction
+        refl_ray = Ray(x, ray.direction - n * 2 * n.dot(ray.direction))
+        into = n.dot(nl) > 0  # if ray from outside in
+        nc = 1
+        nt = 1.5
+        nnt = nc / nt if into else nt / nc
+        ddn = ray.direction.dot(nl)
+        cos2t = 1 - nnt * nnt * (1 - ddn * ddn)
+        # total internal reflection
+        if cos2t < 0:
+            return obj.emission + f * self.radiance(refl_ray, depth)
+        # choose reflection/refraction
+        tdir = (ray.direction * nnt - n * ((1 if into else -1) * (ddn * nnt + sqrt(cos2t)))).norm()
+        a = nt - nc
+        b = nt + nc
+        R0 = a * a / (b * b)
+        c = 1 - (-ddn if into else tdir.dot(n))
+        Re = R0 + (1 - R0) * c ** 4
+        Tr = 1 - Re
+        P = .25 + .5 * Re
+        RP = Re / P
+        TP = Tr / (1 - P)
+
+        # russian roulette
+        if depth > 2:
+            if uniform(0., 1.) < P:
+                return obj.emission + f * self.radiance(refl_ray, depth) * RP
+            else:
+                return obj.emission + f * self.radiance(Ray(x, tdir), depth) * TP
+        else:
+            return self.radiance(refl_ray, depth) * Re + self.radiance(Ray(x, tdir), depth) * Tr
+
     def render(self, samples=1):
         for y in range(self.height):
-            x_i = (0, 0, y ** 3)
+            print('Rendering ({0} spp) {1}%'.format(samples * 4, 100. * y / (self.height - 1)))
             for x in range(self.width):
                 # 2x2 Subsampling
                 image_index = (self.height - y - 1) * self.width + x
+                self.img[image_index] = Vector()
                 for sy in range(2):
                     for sx in range(2):
                         radiance_vec = Vector()
@@ -97,13 +173,14 @@ class Scene:
                             # Ray direction
                             d = (self.c_x * (((sx + .5 + dx) / 2 + x) / self.width - .5) +
                                  self.c_y * (((sy + .5 + dy) / 2 + y) / self.height - .5) +
-                                 self.camera.d)
+                                 self.camera.direction)
                             # Radiance
-                            radiance_vec += (self.radiance(Ray(self.camera.o + d * 140, d.norm()), 0, x_i)
-                                             * (1. / samples))
-                    self.img[image_index] += Vector(self.clamp(radiance_vec.x),
-                                                    self.clamp(radiance_vec.y),
-                                                    self.clamp(radiance_vec.z)) * .25
+                            radiance_vec = radiance_vec + (self.radiance(Ray(self.camera.origin + d * 140, d.norm()), 0)
+                                                           * (1. / samples))
+                    self.img[image_index] = self.img[image_index] + Vector(self.clamp(radiance_vec.x),
+                                                                           self.clamp(radiance_vec.y),
+                                                                           self.clamp(radiance_vec.z)) * .25
+                image_index = image_index + 1
 
         return self.img
 
@@ -122,12 +199,15 @@ class Sphere:
 
     RAY_EPSILON = 1e-4
 
-    def __init__(self, radius, position):
+    def __init__(self, radius, position, emission, color, reflection_type):
         self.radius = radius
         self.position = position
+        self.emission = emission
+        self.color = color
+        self.reflection_type = reflection_type
 
     def intersect(self, ray):
-        ray_sphere_dir = ray.origin - self.position
+        ray_sphere_dir =  self.position - ray.origin
         b = ray_sphere_dir.dot(ray.direction)
         determinant = b * b - ray_sphere_dir.dot(ray_sphere_dir) + self.radius * self.radius
 
@@ -149,14 +229,15 @@ class Sphere:
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
-        print 'Usage: {0} sample_per_pixel'.format(sys.argv[0])
+        print('Usage: {0} sample_per_pixel'.format(sys.argv[0]))
         exit()
-    samples = int(sys.argv[1]) / 4 if len(sys.argv) == 2 else 1
+    samples = int(int(sys.argv[1]) / 4) if len(sys.argv) == 2 else 1
     scene = Scene()
     img = scene.render(samples)
+
     # write to file
     with open('sample.ppm', 'w') as f:
         f.write('P3\n%d %d\n%d\n' % (scene.width, scene.height, 255))
         for px in img:
-            f.write('%d %d %d ' % (px.x, px.y, px.z))
-    print 'Done.'
+            f.write('%d %d %d ' % (scene.to_color(px.x), scene.to_color(px.y), scene.to_color(px.z)))
+    print('Done.')
